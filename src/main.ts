@@ -35,15 +35,26 @@ async function bootstrap(): Promise<void> {
   const swaggerConfig = new DocumentBuilder()
     .setTitle('Chat Kafka API')
     .setDescription(
-      'Multi-tenant messaging service. Authenticate with `Authorization: Bearer <token>`. ' +
-        'Dev tokens: `dev-token-tenant-a` (tenant-a), `dev-token-tenant-b` (tenant-b).',
+      [
+        'Multi-tenant messaging service.',
+        '',
+        '**How to authenticate**',
+        '1. Click the green **Authorize** button (top right).',
+        '2. Paste a dev token in the `Value` field — **without** the `Bearer ` prefix.',
+        '3. Click *Authorize*, then *Close*. All requests now send `Authorization: Bearer <token>`.',
+        '',
+        '**Dev tokens** (configured in `AUTH_API_TOKENS`):',
+        '- `dev-token-tenant-a` → tenant-a',
+        '- `dev-token-tenant-b` → tenant-b',
+      ].join('\n'),
     )
     .setVersion('1.0')
     .addBearerAuth(
       {
         type: 'http',
         scheme: 'bearer',
-        description: 'Dev token e.g. `dev-token-tenant-a`',
+        bearerFormat: 'opaque',
+        description: 'Paste a dev token, e.g. `dev-token-tenant-a` (no `Bearer ` prefix).',
       },
       'bearer',
     )
