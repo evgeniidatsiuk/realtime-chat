@@ -1,5 +1,3 @@
-# chat-kafka
-
 Multi-tenant messaging service. NestJS 11 on Fastify, MongoDB as the source of truth, Kafka as the event bus, Elasticsearch as the search projection.
 
 ---
