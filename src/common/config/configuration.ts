@@ -34,7 +34,7 @@ const parseTokens = (raw: string | undefined): Map<string, string> => {
 };
 
 const parseIntEnv = (raw: string | undefined, fallback: number): number => {
-  const n = raw ? Number.parseIntEnv(raw, 10) : Number.NaN;
+  const n = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isFinite(n) ? n : fallback;
 };
 
