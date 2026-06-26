@@ -11,6 +11,12 @@ import type {
   ListMessagesResult,
   MessageRepository,
 } from '../src/modules/messages/domain/message.repository';
+import { OutboxEntry } from '../src/modules/outbox/domain/outbox-entry';
+import type {
+  ClaimOptions,
+  OutboxRepository,
+} from '../src/modules/outbox/domain/outbox.repository';
+import type { TransactionalWriter } from '../src/modules/outbox/domain/transactional-writer';
 
 export class InMemoryMessageRepository implements MessageRepository {
   readonly rows: Message[] = [];
@@ -69,5 +75,68 @@ export class InMemoryMessageSearchRepository implements MessageSearchRepository 
       page: query.page,
       pageSize: query.pageSize,
     };
+  }
+}
+
+export class InMemoryTransactionalWriter implements TransactionalWriter {
+  inFlight = 0;
+  committed = 0;
+  rolledBack = 0;
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    this.inFlight += 1;
+    try {
+      const result = await fn();
+      this.committed += 1;
+      return result;
+    } catch (error) {
+      this.rolledBack += 1;
+      throw error;
+    } finally {
+      this.inFlight -= 1;
+    }
+  }
+}
+
+export class InMemoryOutboxRepository implements OutboxRepository {
+  readonly entries: OutboxEntry[] = [];
+
+  async enqueue(entry: OutboxEntry): Promise<void> {
+    this.entries.push(entry);
+  }
+
+  async claim({ batchSize }: ClaimOptions): Promise<OutboxEntry[]> {
+    const pending = this.entries.filter((e) => e.status === 'pending').slice(0, batchSize);
+    for (const entry of pending) {
+      const next = OutboxEntry.rehydrate({
+        ...entry.toJSON(),
+        status: 'publishing',
+        attempts: entry.attempts + 1,
+      });
+      const idx = this.entries.indexOf(entry);
+      this.entries[idx] = next;
+    }
+    return this.entries.filter((e) => e.status === 'publishing').slice(0, batchSize);
+  }
+
+  async markPublished(id: string): Promise<void> {
+    const idx = this.entries.findIndex((e) => e.id === id);
+    if (idx === -1) return;
+    this.entries[idx] = OutboxEntry.rehydrate({
+      ...this.entries[idx].toJSON(),
+      status: 'published',
+      publishedAt: new Date(),
+    });
+  }
+
+  async markFailed(id: string, error: string, maxAttempts: number): Promise<void> {
+    const idx = this.entries.findIndex((e) => e.id === id);
+    if (idx === -1) return;
+    const current = this.entries[idx];
+    this.entries[idx] = OutboxEntry.rehydrate({
+      ...current.toJSON(),
+      status: current.attempts >= maxAttempts ? 'failed' : 'pending',
+      lastError: error,
+    });
   }
 }

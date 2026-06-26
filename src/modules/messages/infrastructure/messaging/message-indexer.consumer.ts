@@ -8,13 +8,13 @@ import {
 import { ConfigService } from '@nestjs/config';
 import type { Consumer } from 'kafkajs';
 import type { AppConfig } from '../../../../common/config/configuration';
+import { KafkaClient } from '../../../../common/kafka/kafka.client';
 import type { MessageCreatedEvent } from '../../domain/events/message-created.event';
 import {
   MESSAGE_SEARCH_REPOSITORY,
   type MessageSearchRepository,
 } from '../../domain/message-search.repository';
 import { Message } from '../../domain/message.entity';
-import { KafkaClient } from './kafka.client';
 
 @Injectable()
 export class MessageIndexerConsumer implements OnModuleInit, OnApplicationShutdown {
@@ -56,8 +56,8 @@ export class MessageIndexerConsumer implements OnModuleInit, OnApplicationShutdo
           });
           await this.searchRepo.index(domain);
         } catch (error) {
-          // Surface the failure but do not throw — letting Kafka retry the whole
-          // partition would block ordering for a single poisoned event.
+          // Swallow and log: throwing here would block the partition on a
+          // single bad event and stall every other conversation it shares.
           this.logger.error(
             `Failed to index message: ${(error as Error).message}`,
             (error as Error).stack,

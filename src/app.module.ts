@@ -5,12 +5,14 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { CommonModule } from './common/common.module';
 import type { AppConfig } from './common/config/configuration';
 import { AllExceptionsFilter } from './common/errors/http-exception.filter';
+import { KafkaModule } from './common/kafka/kafka.module';
 import { TenantInterceptor } from './common/tenant/tenant.interceptor';
 import { MessagesModule } from './modules/messages/messages.module';
 
 @Module({
   imports: [
     CommonModule,
+    KafkaModule,
     MongooseModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService<AppConfig, true>) => ({

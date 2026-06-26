@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import type { Model, QueryFilter, SortOrder } from 'mongoose';
+import { TransactionContext } from '../../../outbox/infrastructure/persistence/transaction.context';
 import { Message } from '../../domain/message.entity';
 import type {
   ListMessagesQuery,
@@ -30,14 +31,17 @@ const decodeCursor = (cursor: string): CursorPayload | undefined => {
 
 @Injectable()
 export class MongoMessageRepository implements MessageRepository {
-  constructor(@InjectModel(MessageModel.name) private readonly model: Model<MessageModel>) {}
+  constructor(
+    @InjectModel(MessageModel.name) private readonly model: Model<MessageModel>,
+    private readonly txContext: TransactionContext,
+  ) {}
 
   async save(message: Message): Promise<void> {
     const props = message.toJSON();
     await this.model.updateOne(
       { tenantId: props.tenantId, id: props.id },
       { $setOnInsert: props },
-      { upsert: true },
+      { upsert: true, session: this.txContext.current() },
     );
   }
 

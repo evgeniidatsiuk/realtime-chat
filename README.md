@@ -1,180 +1,226 @@
 # chat-kafka
 
-Production-style RESTful messaging service built with **NestJS 11 + Fastify**, **MongoDB**, **Kafka**, and **Elasticsearch**.
-
-> Tech-test scope: `POST /api/messages`, `GET /api/conversations/:id/messages` (paginated), and `GET /api/conversations/:id/messages/search?q=...` (full-text). Multi-tenant, event-driven, with unit + integration tests.
+Multi-tenant messaging service. NestJS 11 on Fastify, MongoDB as the source of truth, Kafka as the event bus, Elasticsearch as the search projection.
 
 ---
 
-## Quick start
+## Running locally
+
+Requires Node 24+ and pnpm.
 
 ```bash
-# 1. Bring up infrastructure (Kafka KRaft, Mongo 7, Elasticsearch 8, Kafka UI)
+# infrastructure (Kafka KRaft, Mongo replica set, Elasticsearch, Kafka UI)
 docker compose up -d kafka mongo elasticsearch kafka-ui
 
-# 2. Install deps (Node >= 24, pnpm)
+# app
 pnpm install
-
-# 3. Run the app in dev mode
 pnpm start:dev
+```
 
-# OR run everything in Docker
+To run everything inside Docker:
+
+```bash
 docker compose up --build
 ```
 
-Default endpoints:
-- App:           http://localhost:3000
-- Kafka UI:      http://localhost:8080
-- Elasticsearch: http://localhost:9200
-- MongoDB:       mongodb://localhost:27017/chat
+| Service       | URL                                   |
+|---------------|---------------------------------------|
+| App           | http://localhost:3000                 |
+| Kafka UI      | http://localhost:8080                 |
+| Elasticsearch | http://localhost:9200                 |
+| Mongo         | mongodb://localhost:27017/chat (rs0)  |
 
-Auth tokens (dev): `dev-token-tenant-a` → tenant `tenant-a`, `dev-token-tenant-b` → tenant `tenant-b`.
+Default dev tokens are configured in `docker-compose.yml`:
 
-### Example calls
+| Token                  | Tenant     |
+|------------------------|------------|
+| `dev-token-tenant-a`   | `tenant-a` |
+| `dev-token-tenant-b`   | `tenant-b` |
+
+---
+
+## API
+
+All endpoints require `Authorization: Bearer <token>`. The tenant is derived from the token; clients never pass a tenant id in the body or path.
+
+### `POST /api/messages`
 
 ```bash
-# Create a message
 curl -X POST http://localhost:3000/api/messages \
   -H "Authorization: Bearer dev-token-tenant-a" \
   -H "Content-Type: application/json" \
   -d '{"conversationId":"c1","content":"hello world"}'
-
-# List (paginated, newest-first by default)
-curl "http://localhost:3000/api/conversations/c1/messages?limit=20&sort=desc" \
-  -H "Authorization: Bearer dev-token-tenant-a"
-
-# Full-text search
-curl "http://localhost:3000/api/conversations/c1/messages/search?q=hello&page=1&pageSize=20" \
-  -H "Authorization: Bearer dev-token-tenant-a"
 ```
+
+Body:
+
+```ts
+{
+  conversationId: string;   // required, max 128
+  content: string;          // required, 1..8000
+  senderId?: string;        // defaults to the principal user id
+  metadata?: object;        // free-form, stored alongside the message
+}
+```
+
+Response: the created message view.
+
+### `GET /api/conversations/:conversationId/messages`
+
+Cursor-paginated list, newest-first by default.
+
+```
+?limit=20            # 1..100, default 20
+?sort=asc|desc       # default desc
+?cursor=<opaque>     # nextCursor returned by the previous page
+```
+
+### `GET /api/conversations/:conversationId/messages/search`
+
+```
+?q=<term>            # required
+?page=1              # 1..1000
+?pageSize=20         # 1..100
+```
+
+Returns hits with `score`, `highlights`, and a `total`.
 
 ---
 
 ## Architecture
 
-### Layered DDD per bounded context (`messages`)
+### Modules
 
 ```
-src/modules/messages/
-├── domain/              # entity, repository interfaces (ports), domain events
-├── application/         # use cases, DTOs, output ports
-├── infrastructure/      # mongo / kafka / elasticsearch adapters
-└── interfaces/http/     # controllers + view models
+src/
+├── common/                 # config, kafka client, auth guard, tenant context, error filter
+└── modules/
+    ├── messages/           # bounded context: messages, conversations
+    │   ├── domain/                 # entity, repository ports, domain events
+    │   ├── application/            # use cases, DTOs, publisher port
+    │   ├── infrastructure/         # mongo / outbox-publisher / es / kafka-consumer adapters
+    │   └── interfaces/http/        # controllers + presenters
+    └── outbox/             # transactional outbox shared infrastructure
+        ├── domain/                 # OutboxEntry, OutboxRepository, TransactionalWriter
+        ├── application/            # OutboxPoller (background)
+        └── infrastructure/
+            ├── persistence/        # mongo adapter + ALS-backed session context
+            └── messaging/          # generic Kafka publisher
 ```
 
-* **Domain layer** is framework-free: `Message` enforces invariants (non-empty, length bound, required tenantId/conversationId/senderId). Repository interfaces (`MessageRepository`, `MessageSearchRepository`) and the `MessagePublisher` port are pure TypeScript.
-* **Application layer** orchestrates use cases (`CreateMessageUseCase`, `ListMessagesUseCase`, `SearchMessagesUseCase`) and depends on ports via Symbol DI tokens — adapters can be swapped without touching the core.
-* **Infrastructure layer** holds Mongoose schemas/repository, KafkaJS client/producer/consumer, and the Elasticsearch search adapter.
-* **Interfaces layer** is the HTTP boundary: thin controllers + presenter mappers, kept dumb so the use cases stay testable.
-
-### Event-driven flow
+Cross-cutting flow:
 
 ```
-HTTP POST /api/messages
-  └─► CreateMessageUseCase
-        ├─► MessageRepository.save        (Mongo, primary write)
-        └─► MessagePublisher.publish      (Kafka topic "messages.created")
+POST /api/messages
+  ╔═══════════════════ Mongo transaction ═══════════════════╗
+  ║ MessageRepository.save        ─► messages collection    ║
+  ║ MessagePublisher.publish      ─► outbox collection      ║
+  ╚═════════════════════════════════════════════════════════╝
+
+OutboxPoller (in-process, single tick every OUTBOX_POLL_INTERVAL_MS)
+  ─► OutboxRepository.claim          (atomic findOneAndUpdate per row)
+  ─► KafkaOutboxPublisher.publish    (idempotent producer)
+  ─► OutboxRepository.markPublished
 
 Kafka topic "messages.created"
-  └─► MessageIndexerConsumer (group "message-indexer")
-        └─► MessageSearchRepository.index  (Elasticsearch)
+  ─► MessageIndexerConsumer (group "message-indexer")
+  ─► ElasticsearchMessageSearchRepository.index
 ```
 
-The write is **persisted to MongoDB first**, then the event is published. Indexing is **eventually consistent** — `GET /search` reads the projection materialised by the consumer. This decouples write latency from search availability and lets us scale the indexer independently.
+### Transactional outbox
+
+`CreateMessageUseCase` opens a Mongo transaction via `TransactionalWriter` and writes the message document plus an `outbox` row in the same commit. If anything fails, both rows roll back together — the system never ends up with a persisted message that has no corresponding event, and never publishes an event for a message that didn't commit.
+
+`OutboxPoller` runs in every app instance. Each tick claims a batch with an atomic `findOneAndUpdate({ status: pending | (publishing AND lease expired) }, { status: publishing, leaseExpiresAt: now+lease })`, sorted by `createdAt`. Two replicas racing on the same row see only one winner per call, so the poller is safe to run horizontally. On publish:
+
+- success → `markPublished` + `publishedAt` (the row becomes eligible for TTL eviction).
+- failure → `markFailed`, which either drops the lease (re-queue) or promotes the row to `failed` once `attempts >= OUTBOX_MAX_ATTEMPTS`. `failed` rows stay in the collection for inspection and manual re-drive.
+
+The poller drains until `claim` returns empty, so a write burst is flushed without waiting for the next tick.
 
 ### Multi-tenancy
 
-* `Authorization: Bearer <token>` resolves to a tenant via the configured token→tenant map (`AUTH_API_TOKENS`).
-* `AuthGuard` produces a `principal` on the request; the `TenantInterceptor` then opens an `AsyncLocalStorage` scope with `{ tenantId, userId }`.
-* Every Mongo filter, Kafka event payload, and ES query is constrained by the active `tenantId`. There is no path where a user can read a tenant they do not own — even the controller never accepts a tenant in the body.
+`AuthGuard` validates `Authorization: Bearer …`, resolves the tenant, and attaches the principal to the request. `TenantInterceptor` then opens an `AsyncLocalStorage` scope so every downstream call — Mongo filters, outbox payloads, ES queries — reads the tenant from `TenantContext.get()` rather than threading it through every signature.
 
-### Kafka design
+A second ALS scope (`TransactionContext`) carries the active Mongo `ClientSession`, so any repository call that runs inside `TransactionalWriter.run(fn)` automatically joins the transaction without taking the session as a parameter.
 
-* **Topic:** `messages.created` (configurable). Default 6 partitions (set on the broker).
-* **Key:** `${tenantId}:${conversationId}` — preserves ordering per conversation on a single partition while still spreading load across the cluster.
-* **Producer:** idempotent (`idempotent: true`, `allowAutoTopicCreation: true`) so retries don't duplicate events.
-* **Consumer group:** `message-indexer` — horizontal scaling of indexers comes from running more app replicas; Kafka rebalances partitions automatically.
-* **Failure handling:** the consumer logs and absorbs poison messages so a single bad event cannot block the partition. In production this would be paired with a dead-letter topic.
+### Kafka
 
-### MongoDB schema & indexes
+- Topic: `messages.created` (default 6 partitions; broker is configured with `KAFKA_CFG_NUM_PARTITIONS=6`).
+- Partition key: `${tenantId}:${conversationId}` — guarantees per-conversation ordering on a single partition.
+- Producer: `idempotent: true`, max in-flight 5. Combined with the outbox, the consumer-side de-dup boils down to "have we already indexed this `id`".
+- Consumer group: `message-indexer`. To scale indexing, run more app replicas; Kafka rebalances partitions across them.
+- The consumer catches per-message exceptions and logs them. A poison message does not block its partition.
 
-`messages` collection (one document per message):
+### MongoDB
 
-```ts
-{
-  id, tenantId, conversationId, senderId,
-  content, timestamp, metadata?
-}
-```
+`messages` collection:
 
-Indexes:
+| Index                                                       | Purpose                                                |
+|-------------------------------------------------------------|--------------------------------------------------------|
+| `(tenantId, conversationId, timestamp desc, id asc)`        | Primary list query — keyset pagination, tenant-scoped  |
+| `(tenantId, id)` unique                                     | Idempotent upserts, point reads scoped to a tenant     |
 
-| Index                                                       | Purpose                                                 |
-|-------------------------------------------------------------|---------------------------------------------------------|
-| `(tenantId, conversationId, timestamp desc, id asc)`        | Primary list query — keyset pagination, tenant-scoped   |
-| `(tenantId, id)` unique                                     | Idempotent upserts + point reads scoped to a tenant     |
+`outbox` collection:
 
-Pagination is **cursor-based** (`{timestamp, id}` encoded as base64url). This avoids the `skip + limit` performance cliff on deep pages and works correctly under concurrent inserts.
+| Index                                          | Purpose                                                       |
+|------------------------------------------------|---------------------------------------------------------------|
+| `(status, createdAt)`                          | Drives the poller's claim query, bounds scan to recent work   |
+| `publishedAt` TTL (7 days)                     | Reaps successfully-delivered rows; failed rows are preserved  |
 
-### Elasticsearch index
+List pagination is cursor-based: the cursor encodes `{timestamp, id}` as base64url and the query uses a keyset predicate. Skip/limit is intentionally avoided — it doesn't scale on deep pages and skips/repeats rows under concurrent inserts.
 
-Index `messages` with a strict mapping:
-* `tenantId`, `conversationId`, `senderId`, `id` → `keyword` (filter-able, no analysis cost)
-* `content` → `text` with a custom `message_analyzer` (`lowercase` + `asciifolding` + `stop`)
-* `timestamp` → `date`
-* `metadata` → `object` with `enabled: false` (stored but not indexed — searching arbitrary nested metadata is not in scope and we don't want a mapping explosion)
+A single-node replica set (`rs0`) is required because Mongo transactions only work on replica sets. The container is configured for primary-only RS via the bitnami image.
 
-Search uses a `bool` query: `must` (match on content with `operator: and`) + `filter` (term filters on `tenantId` + `conversationId`). Filters live in the bool's `filter` clause to avoid scoring overhead. Results are sorted by `_score desc, timestamp desc` and include highlight snippets.
+### Elasticsearch
 
-### SOLID notes
+Index `messages`, strict mapping:
 
-* **S**: each class has one reason to change — the use case orchestrates, the repository persists, the publisher sends, the controller adapts HTTP. Domain entity owns invariants only.
-* **O**: new adapters (e.g. swap Mongo for Postgres, or Kafka for NATS) plug in via the port interfaces with zero churn in domain/application code.
-* **L**: in-memory test adapters in `test/in-memory.adapters.ts` are drop-in substitutes for the production ones — proof the contracts are honoured.
-* **I**: `MessagePublisher`, `MessageRepository`, `MessageSearchRepository` are small, focused interfaces — no fat "do everything" ports.
-* **D**: every cross-layer dependency is on an abstraction (Symbol DI token). Domain depends on nothing; application depends only on its own ports; infrastructure implements those ports.
+- `id`, `tenantId`, `conversationId`, `senderId` → `keyword`
+- `content` → `text` with a custom `message_analyzer` (`standard` tokenizer + `lowercase` + `asciifolding` + `stop`)
+- `timestamp` → `date`
+- `metadata` → `object` with `enabled: false` (stored but not indexed; arbitrary nested keys would otherwise blow up the mapping)
 
-### Code quality tooling
+Search query: `bool` with `must: match(content, operator: and)` and `filter: term(tenantId), term(conversationId)`. Filters sit in `filter` so they don't contribute to scoring. Hits are sorted by `_score desc, timestamp desc` and returned with highlight snippets.
 
-* **Biome** for lint + format (replaces ESLint + Prettier).
-* **nestjs-doctor** for DI / SOLID / module-structure validation. Current score: **97/100**.
-* **Jest** for unit tests; **Jest + Fastify `.inject`** for e2e tests (no live infra required — adapters are swapped for in-memory fakes).
+### Security
+
+- All endpoints behind `AuthGuard`; missing/invalid bearer → 401.
+- `ValidationPipe` runs globally with `whitelist`, `forbidNonWhitelisted`, and `transform` — unknown fields are rejected, types are coerced from query strings.
+- `@fastify/helmet` is registered for HTTP headers.
+- Content is trimmed and length-bounded at the domain layer. The API is JSON-only and content is stored verbatim; no template rendering happens server-side.
+- Tenant isolation is enforced at the repository and search layers — there is no codepath where a query is issued without the tenant filter from `TenantContext`.
 
 ---
 
 ## Commands
 
 ```bash
-pnpm start:dev      # watch mode
-pnpm build          # nest build
-pnpm test           # unit tests (src/**/*.spec.ts)
-pnpm test:e2e       # API integration tests (test/*.e2e-spec.ts)
-pnpm lint           # biome lint --write
-pnpm format         # biome format --write
-pnpm check          # biome lint + format + organize imports
-pnpm exec nestjs-doctor   # static health report
+pnpm start:dev               # watch mode
+pnpm build                   # nest build
+pnpm test                    # unit tests
+pnpm test:e2e                # API integration tests (Fastify .inject + in-memory adapters)
+pnpm lint                    # biome lint --write
+pnpm format                  # biome format --write
+pnpm check                   # biome check --write (lint + format + organize imports)
+pnpm exec nestjs-doctor      # static DI/SOLID/module audit
 ```
 
-## Environment variables
+## Configuration
 
-| Var                            | Default                                | Notes                                    |
-|--------------------------------|----------------------------------------|------------------------------------------|
-| `PORT`                         | `3000`                                 |                                          |
-| `MONGO_URI`                    | `mongodb://localhost:27017/chat`       |                                          |
-| `KAFKA_BROKERS`                | `localhost:9094`                       | Comma-separated                          |
-| `KAFKA_CLIENT_ID`              | `chat-app`                             |                                          |
-| `KAFKA_GROUP_ID`               | `message-indexer`                      |                                          |
-| `KAFKA_TOPIC_MESSAGES_CREATED` | `messages.created`                     |                                          |
-| `ELASTICSEARCH_NODE`           | `http://localhost:9200`                |                                          |
-| `ELASTICSEARCH_INDEX`          | `messages`                             |                                          |
-| `AUTH_API_TOKENS`              | `dev-token-tenant-a:tenant-a`          | `token:tenant,token:tenant`              |
-
----
-
-## Trade-offs & what I'd add next
-
-* **Outbox pattern**: today the write to Mongo and the publish to Kafka are not atomic. A transactional outbox collection (or change-streams) would close that gap for stricter delivery guarantees.
-* **Dead-letter topic**: poison-message handling currently logs and drops; a DLT would let ops re-drive failures.
-* **Caching**: hot conversations could go through a Redis cache in front of the list endpoint.
-* **Real auth**: tokens are config-loaded for the test. Production would use JWT/OIDC with proper key rotation; the `AuthGuard` boundary is already isolated so the swap is local.
-* **Telemetry**: OpenTelemetry traces around the HTTP → Kafka → ES path would make causal debugging trivial.
+| Variable                          | Default                                                              |
+|-----------------------------------|----------------------------------------------------------------------|
+| `PORT`                            | `3000`                                                               |
+| `MONGO_URI`                       | `mongodb://localhost:27017/chat?replicaSet=rs0&directConnection=true`|
+| `KAFKA_BROKERS`                   | `localhost:9094` (comma-separated)                                   |
+| `KAFKA_CLIENT_ID`                 | `chat-app`                                                           |
+| `KAFKA_GROUP_ID`                  | `message-indexer`                                                    |
+| `KAFKA_TOPIC_MESSAGES_CREATED`    | `messages.created`                                                   |
+| `ELASTICSEARCH_NODE`              | `http://localhost:9200`                                              |
+| `ELASTICSEARCH_INDEX`             | `messages`                                                           |
+| `OUTBOX_ENABLED`                  | `true`                                                               |
+| `OUTBOX_POLL_INTERVAL_MS`         | `500`                                                                |
+| `OUTBOX_BATCH_SIZE`               | `50`                                                                 |
+| `OUTBOX_LEASE_MS`                 | `30000`                                                              |
+| `OUTBOX_MAX_ATTEMPTS`             | `10`                                                                 |
+| `AUTH_API_TOKENS`                 | `dev-token-tenant-a:tenant-a` (`token:tenant,token:tenant`)          |

@@ -1,5 +1,9 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { TenantContext } from '../../../../common/tenant/tenant-context';
+import {
+  TRANSACTIONAL_WRITER,
+  type TransactionalWriter,
+} from '../../../outbox/domain/transactional-writer';
 import { buildMessageCreatedEvent } from '../../domain/events/message-created.event';
 import { Message } from '../../domain/message.entity';
 import { MESSAGE_REPOSITORY, type MessageRepository } from '../../domain/message.repository';
@@ -8,11 +12,10 @@ import { MESSAGE_PUBLISHER, type MessagePublisher } from '../ports/message-publi
 
 @Injectable()
 export class CreateMessageUseCase {
-  private readonly logger = new Logger(CreateMessageUseCase.name);
-
   constructor(
     @Inject(MESSAGE_REPOSITORY) private readonly repository: MessageRepository,
     @Inject(MESSAGE_PUBLISHER) private readonly publisher: MessagePublisher,
+    @Inject(TRANSACTIONAL_WRITER) private readonly writer: TransactionalWriter,
     private readonly tenantContext: TenantContext,
   ) {}
 
@@ -26,16 +29,13 @@ export class CreateMessageUseCase {
       metadata: dto.metadata,
     });
 
-    await this.repository.save(message);
-
-    try {
+    // The repository write and the outbox enqueue commit together. If either
+    // fails the entire unit of work rolls back, so we never leave the system
+    // with a persisted message that has no corresponding event.
+    await this.writer.run(async () => {
+      await this.repository.save(message);
       await this.publisher.publishMessageCreated(buildMessageCreatedEvent(message.toJSON()));
-    } catch (error) {
-      this.logger.error(
-        `Failed to publish message.created for ${message.id}: ${(error as Error).message}`,
-      );
-      throw error;
-    }
+    });
 
     return message;
   }
